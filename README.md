@@ -155,9 +155,17 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 
 ## 6. Chạy và kiểm tra
 
+Chạy toàn bộ pipeline workflow:
+
 ```bash
 day09 run
 day09 validate
+```
+
+Chạy kiểm tra unit test:
+
+```bash
+pytest -v tests/test_workflow.py
 ```
 
 Kết quả được tạo tại:
