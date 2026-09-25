@@ -32,6 +32,15 @@ python -m pip install -e ".[dev]"
 cp .env.example .env
 ```
 
+Trên Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+```
+
 Kiểm tra:
 
 ```bash
