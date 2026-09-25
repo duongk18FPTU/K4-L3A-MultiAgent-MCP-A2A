@@ -17,6 +17,9 @@ Ba specialist chạy đồng thời trong `TaskGroup`; policy chờ các handoff
 Verifier phải thành công trước khi trả output. CLI ghi output qua file tạm rồi
 replace. Solver sở hữu toàn bộ lifecycle event, CLI không ghi trùng receive/finalize.
 `case_finalized` nghĩa là quyết định đã qua verifier; lỗi lưu file của CLI vẫn là lỗi run.
+CLI gọi `runner.solve_with_reconnect`: mỗi case/attempt dùng MCP session mới.
+Không giữ một session HTTP xuyên suốt 100 case. Khi stream chết, retry tạo lại
+cả HTTP client và MCP session, chạy lại case chưa hoàn tất với context/evidence mới.
 
 ## 2. Agent ownership
 
@@ -41,7 +44,8 @@ Handoff nội bộ dùng context của `CaseWorkflow`, kèm trace envelope có `
 `actor`, `target`, `evidence_refs` và decision code. Context tách biệt ngay cả khi
 hai case trùng order. Không có remote A2A server hoặc framework/LLM phụ thuộc ngoài.
 
-Mỗi MCP/discovery có timeout 45 giây. Tối đa ba call cùng lúc trong một case.
+Mỗi MCP/discovery và bước initialize có timeout 45 giây. Tối đa ba call cùng lúc
+trong một case; CLI xử lý các case tuần tự.
 `TaskGroup` cancel và join các sibling khi có lỗi; state không quay lại nên không
 có vòng lặp retry vô hạn. Trace chỉ chứa sự kiện quan sát được, mã quyết định,
 domain, hash do gateway trả; không chứa prompt hoặc chain-of-thought.
@@ -87,7 +91,9 @@ domain, và 0.35 khi không đủ bằng chứng. Không xuất confidence 1.0.
 
 | Failure | Retry | Kết quả |
 | --- | --- | --- |
-| Timeout / transport / 403 / tool error | Không | Propagate lỗi, không finalize hoặc tự tạo output |
+| ReadError / ConnectError / network timeout / stream đóng | Tối đa 3 attempts/case | Session mới, backoff 1s rồi 2s, chạy lại case chưa hoàn tất |
+| HTTP 429 / 500 / 502 / 503 / 504 từ transport | Cùng giới hạn trên | Reconnect; không diễn giải thành evidence |
+| 401 / 403 / tool error nghiệp vụ | Không | Propagate lỗi, không finalize hoặc tự tạo output |
 | Tool không discovery được / sai input schema | Không | Dừng trước khi dùng tool không hợp lệ |
 | Evidence sai schema/domain/scope | Không | Từ chối evidence, không finalize |
 | Thiếu dữ kiện trong response hợp lệ | Không | `insufficient_evidence`, `needs_investigation`, refund 0 |
@@ -95,9 +101,32 @@ domain, và 0.35 khi không đủ bằng chứng. Không xuất confidence 1.0.
 | Verifier không pass | Không | Không finalize |
 
 Specialist thất bại ghi handoff về coordinator với `EVIDENCE_COLLECTION_FAILED`
-và error type; không ghi lỗi đó thành `tool_result_consumed`. Không retry tự động vì
-request timeout có thể đã được audit ở server. CLI dừng khi case lỗi; chạy lại sẽ
-tạo mới output/trace theo hành vi có sẵn của starter.
+khi lỗi được workflow bắt; lỗi background transport còn có thể xuất hiện dưới dạng
+`ExceptionGroup` khi session đóng. Runner phân loại tất cả leaf exception, kể cả
+`EvidenceError` bọc lỗi TaskGroup: chỉ retry khi mọi lỗi là transport có thể phục hồi.
+Nhóm lỗi trộn schema/scope với transport không được retry. Cancellation được propagate.
+HTTP response hook giữ mã lỗi POST trước khi MCP SDK đổi HTTP non-2xx thành
+`MCPError: Server returned an error response`. Không ghi response body hoặc header
+Authorization. GET/DELETE tùy chọn vẫn do SDK xử lý, tránh coi 405 khi đóng session
+là lỗi điều tra. Không retry MCP internal error chung chỉ dựa vào thông báo mơ hồ.
+
+Retry sau khi bắt đầu điều tra ghi event hợp lệ `handoff`, decision code
+`MCP_RECONNECT`, metadata trong `attributes` (attempt, next_attempt, delay_seconds,
+error_type). Không thêm field/schema hoặc event type mới. Nếu initialize chưa thành
+công thì log retry ra stderr, giữ `case_received` là event đầu tiên của lifecycle.
+Không xóa trace lần thất bại; output chỉ dùng ref mới lấy trong attempt thành công.
+Calls lặp lại có thể đã được server audit: đây là retry các tool đọc, không phải
+cam kết exactly-once và không tái sử dụng ref để che số lần gọi.
+
+Nếu chỉ mất kết nối trong teardown sau khi solver đã hoàn tất và output đã validate,
+giữ kết quả đã xác minh; không chạy lại hoặc ghi thêm finalize. Hết 3 attempts thì
+dừng với thông báo gọn, giữ output các case trước. `day09 run --resume` kiểm schema,
+case/order scope, refs đã consumed và đúng policy/verification/finalize trong cùng
+attempt trước khi bỏ qua output đã hoàn tất. Giữ nguyên trace cũ và chạy mới case
+chưa có output; không tái dùng evidence một phần. Artifact hỏng/thiếu trace bị từ
+chối, không tự xóa hoặc sửa trace. `run` không có `--resume` vẫn chạy mới từ đầu.
+Chỉ resume trong cùng competition run/team/case-set phía server; local schema và
+trace không thể xác nhận lại server-side ownership khi server đã reset run.
 
 ## 6. Verification invariants
 
@@ -115,6 +144,11 @@ tạo mới output/trace theo hành vi có sẵn của starter.
 
 ## 7. Reproducibility
 
+Public contracts trong `contracts/schemas/` giữ nguyên. Test `test_contract_lock.py`
+khóa SHA-256 trên nội dung JSON canonical của cả 5 schema (không phụ thuộc CRLF/LF),
+kiểm schema hợp lệ và việc từ chối field ngoài schema. Không sửa schema để hợp thức
+hóa output. Envelope, trace, output và manifest đều qua validator công khai của repo.
+
 Không dùng LLM hoặc random seed trong policy engine. Event ID và evidence ref là
 định danh runtime; không ảnh hưởng quyết định. Dependencies vẫn theo khoảng version
 của `pyproject.toml`; lần triển khai này kiểm thử với Python 3.12, MCP 2.2.0,
@@ -122,10 +156,11 @@ httpx2 2.13.1, jsonschema 4.26.0, pytest 8.4.2.
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -m pytest -q tests/test_starter.py tests/test_workflow.py tests/test_gateway.py
+python -m pytest -q tests/test_starter.py tests/test_workflow.py tests/test_gateway.py tests/test_runner.py tests/test_contract_lock.py
 python -m ruff check src tests
 python -m student_agent.cli validate-inputs
 python -m student_agent.cli run
+python -m student_agent.cli run --resume
 python -m student_agent.cli validate
 ```
 

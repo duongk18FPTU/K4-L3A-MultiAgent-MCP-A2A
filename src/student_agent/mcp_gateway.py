@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +12,22 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import PaginatedRequestParams
 
 from .contracts import Contracts
+
+
+class GatewayHTTPError(RuntimeError):
+    """Preserve HTTP status before the SDK replaces it with generic INTERNAL_ERROR."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"MCP gateway returned HTTP {status_code}")
+
+
+async def check_http_response(response: httpx2.Response) -> None:
+    # Do not print request headers, credentials or the untrusted response body.
+    # GET/DELETE may legitimately return 405 for an unsupported optional SSE /
+    # session-termination endpoint; let the SDK handle those transport responses.
+    if response.request.method == "POST" and response.status_code >= 400:
+        raise GatewayHTTPError(response.status_code)
 
 
 class EvidenceGateway:
@@ -73,9 +90,12 @@ async def connect_gateway(
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
     async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
+        httpx2.AsyncClient(
+            headers=headers, timeout=timeout, event_hooks={"response": [check_http_response]}
+        ) as http_client,
         streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as session,
     ):
-        await session.initialize()
+        async with asyncio.timeout(45):
+            await session.initialize()
         yield EvidenceGateway(session, contracts)

@@ -4,10 +4,11 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx2
 import pytest
 
 from student_agent.contracts import Contracts
-from student_agent.mcp_gateway import EvidenceGateway
+from student_agent.mcp_gateway import EvidenceGateway, GatewayHTTPError, check_http_response
 
 
 def test_mcp_v2_discovery_pagination_and_cache():
@@ -69,3 +70,39 @@ def test_tool_error_is_not_evidence():
 
     with pytest.raises(RuntimeError, match="403"):
         asyncio.run(EvidenceGateway(Session(), None).call("get_order", case_id="TEST_CASE_001"))
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 502, 503, 504])
+def test_http_hook_preserves_status_without_leaking_body(status):
+    response = httpx2.Response(
+        status,
+        text="private details",
+        request=httpx2.Request(
+            "POST",
+            "https://example.invalid/mcp",
+            headers={"Authorization": "Bearer secret"},
+        ),
+    )
+    with pytest.raises(GatewayHTTPError) as info:
+        asyncio.run(check_http_response(response))
+    assert info.value.status_code == status
+    assert str(info.value) == f"MCP gateway returned HTTP {status}"
+
+
+def test_http_hook_does_not_consume_success_stream():
+    response = httpx2.Response(
+        200,
+        text="event: message",
+        request=httpx2.Request(
+            "POST",
+            "https://example.invalid/mcp",
+        ),
+    )
+    asyncio.run(check_http_response(response))
+    assert response.text == "event: message"
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_optional_transport_endpoint_405_is_left_to_sdk(method):
+    response = httpx2.Response(405, request=httpx2.Request(method, "https://example.invalid/mcp"))
+    asyncio.run(check_http_response(response))
