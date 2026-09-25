@@ -10,6 +10,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.workflow-venv/
 venv/
 .pytest_cache/
 .ruff_cache/

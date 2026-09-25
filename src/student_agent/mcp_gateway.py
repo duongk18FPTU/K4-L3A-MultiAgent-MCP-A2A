@@ -8,6 +8,7 @@ from typing import Any
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import PaginatedRequestParams
 
 from .contracts import Contracts
 
@@ -16,15 +17,39 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_catalog: dict[str, dict[str, Any]] | None = None
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        return sorted(await self.describe_tools())
+
+    async def describe_tools(self) -> dict[str, dict[str, Any]]:
+        """Discover full input contracts, including paginated tool inventories."""
+        if self._tool_catalog is not None:
+            return self._tool_catalog
+        tools = {}
+        cursor = None
+        seen_cursors = set()
+        while True:
+            response = await self._session.list_tools(
+                params=PaginatedRequestParams(cursor=cursor) if cursor else None
+            )
+            for tool in response.tools:
+                tools[tool.name] = {
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                }
+            cursor = response.next_cursor
+            if not cursor:
+                self._tool_catalog = tools
+                return tools
+            if cursor in seen_cursors:
+                raise ValueError("MCP discovery returned a repeated pagination cursor")
+            seen_cursors.add(cursor)
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
